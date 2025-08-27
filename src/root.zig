@@ -34,59 +34,39 @@ const Face = struct {
         return scale(ctr, 1.0 / n);
     }
 
+    fn newellPlane(face: *const Face, vertices: []const Vertex) [4]f32 {
+        var normal: [3]f32 = .{0} ** 3;
+        var ctr: [3]f32 = .{0} ** 3;
+        var edge = face.edge;
+        var n: f32 = 0;
+        while (true) {
+            const v0 = vertices[edge.tail_vertex];
+            const v1 = vertices[edge.next.tail_vertex];
+            ctr = add(ctr, v0);
+            normal = add(normal, .{
+                (v0[1] - v1[1]) * (v0[2] + v1[2]),
+                (v0[2] - v1[2]) * (v0[0] + v1[0]),
+                (v0[0] - v1[0]) * (v0[1] + v1[1]),
+            });
+            n += 1;
+            edge = edge.next;
+            if (edge == face.edge) break;
+        }
+        const norm = 1.0 / length(normal);
+        normal = scale(normal, 1.0 / norm);
+        ctr = scale(ctr, 1.0 / n);
+        return .{
+            normal[0],
+            normal[1],
+            normal[2],
+            -dot(normal, ctr),
+        };
+    }
+
     fn addConflict(face: *Face, arena: std.mem.Allocator, vertex: u32) !void {
         const conflict = try arena.create(Conflict);
         conflict.* = .{ .next = face.conflicts, .vertex = vertex };
         face.conflicts = conflict;
-    }
-
-    fn assertValid(head: *Face, vertices: []const Vertex, epsilon: f32) void {
-        var walk: ?*Face = head;
-        while (walk) |face| {
-            var edge = face.edge;
-            while (true) {
-                std.debug.assert(edge.next.prev == edge);
-                std.debug.assert(edge.prev.next == edge);
-                std.debug.assert(edge.twin.twin == edge);
-
-                std.debug.assert(edge.face == face);
-                std.debug.assert(edge.twin.face != edge.face);
-
-                std.debug.assert(edge.tail_vertex < vertices.len);
-                std.debug.assert(edge.twin.tail_vertex == edge.next.tail_vertex);
-                std.debug.assert(edge.twin.next.tail_vertex == edge.tail_vertex);
-
-                // all vertices of the plane must be in the plane (within tolerance)
-                std.debug.assert(@abs(signedDistancePointPlane(
-                    vertices[edge.tail_vertex],
-                    face.plane,
-                )) < epsilon);
-
-                // face edge loop must be convex
-                // not sure what epsilon value to use here though
-                // since the given one is interpreted in world space, and this is not
-                const u = sub(vertices[edge.next.tail_vertex], vertices[edge.tail_vertex]);
-                const v = sub(vertices[edge.prev.tail_vertex], vertices[edge.tail_vertex]);
-                std.debug.assert(dot(cross(u, v), face.plane[0..3].*) >= 0); // FIXME epsilon?
-
-                // the centroid of negihbouring faces must be behind this face
-                std.debug.assert(signedDistancePointPlane(
-                    centroid(edge.twin.face, vertices),
-                    face.plane,
-                ) < epsilon);
-
-                // walk in a cycle around the tail vertex
-                var walk2 = edge;
-                while (true) {
-                    walk2 = walk2.twin.next;
-                    if (walk2 == edge) break;
-                }
-
-                edge = edge.next;
-                if (edge == face.edge) break;
-            }
-            walk = face.next;
-        }
     }
 };
 
@@ -317,7 +297,7 @@ fn buildInitialTetrahedron(
         if (signedDistancePointPlane(vertex, face3.plane) > epsilon) try face3.addConflict(arena, i);
     }
 
-    face0.assertValid(vertices, epsilon);
+    try assertValid(arena, face0, vertices, epsilon);
     return face0;
 }
 
@@ -376,6 +356,10 @@ fn scale(a: [3]f32, x: f32) [3]f32 {
     };
 }
 
+fn dot(a: [3]f32, b: [3]f32) f32 {
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
 fn cross(a: [3]f32, b: [3]f32) [3]f32 {
     return .{
         a[1] * b[2] - a[2] * b[1],
@@ -425,8 +409,8 @@ test "rotated dodecahedron" {
         var rotated = try std.ArrayList([3]f32).initCapacity(arena, vertices.len);
         for (vertices) |vertex| rotated.appendAssumeCapacity(qRotate(vertex, q));
 
-        const faces = try quickhull(arena, rotated.items, 1e-5);
-        _ = faces;
+        const faces = try quickhull(arena, rotated.items, 1e-6);
+        try assertValid(arena, faces, rotated.items, 1e-6);
     }
 }
 
@@ -454,6 +438,135 @@ fn qRandom(rand: std.Random) [4]f32 {
         inorm * w,
     };
 }
-fn dot(a: [3]f32, b: [3]f32) f32 {
-    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+
+fn assertValid(
+    arena: std.mem.Allocator,
+    head: *Face,
+    vertices: []const Vertex,
+    epsilon: f32,
+) !void {
+    var total_vertex_counts = try arena.alloc(u32, vertices.len);
+    for (0..total_vertex_counts.len) |i| total_vertex_counts[i] = 0;
+
+    var local_vertex_counts = try arena.alloc(u32, vertices.len);
+
+    var vertex_pairs: std.AutoHashMapUnmanaged(struct { u32, u32 }, void) = .empty;
+    try vertex_pairs.ensureTotalCapacity(arena, @intCast(6 * vertices.len));
+
+    var faces_list: std.AutoHashMapUnmanaged(*Face, void) = .empty;
+    try faces_list.ensureTotalCapacity(arena, @intCast(2 * vertices.len));
+
+    // the way this is filled could be more exhaustive
+    var faces_dfs: std.AutoHashMapUnmanaged(*Face, void) = .empty;
+    try faces_dfs.ensureTotalCapacity(arena, @intCast(2 * vertices.len));
+
+    var n_faces: u32 = 0;
+    var n_half_edges: u32 = 0;
+    var n_vertices: u32 = 0;
+
+    var walk: ?*Face = head;
+    while (walk) |face| {
+        var edge = face.edge;
+        var n_sides: u32 = 0;
+
+        std.debug.assert(!faces_list.contains(face));
+        try faces_list.put(arena, face, {});
+
+        for (0..local_vertex_counts.len) |i| local_vertex_counts[i] = 0;
+
+        while (true) {
+            std.debug.assert(edge.next.prev == edge);
+            std.debug.assert(edge.prev.next == edge);
+            std.debug.assert(edge.twin != edge);
+            std.debug.assert(edge.twin.twin == edge);
+
+            std.debug.assert(edge.face == face);
+            std.debug.assert(edge.twin.face != edge.face);
+
+            std.debug.assert(edge.tail_vertex < vertices.len);
+            std.debug.assert(edge.twin.tail_vertex == edge.next.tail_vertex);
+            std.debug.assert(edge.twin.next.tail_vertex == edge.tail_vertex);
+
+            // all vertices of the plane must be in the plane (within tolerance)
+            std.debug.assert(@abs(signedDistancePointPlane(
+                vertices[edge.tail_vertex],
+                face.plane,
+            )) < epsilon);
+
+            // face edge loop must be convex
+            // scale epsilon by the size of the non-normalized dot product
+            const u = sub(vertices[edge.next.tail_vertex], vertices[edge.tail_vertex]);
+            const v = sub(vertices[edge.prev.tail_vertex], vertices[edge.tail_vertex]);
+            std.debug.assert(
+                dot(cross(u, v), face.plane[0..3].*) >= -epsilon * length(u) * length(v),
+            );
+
+            // the centroid of negihbouring faces must be behind this face
+            std.debug.assert(signedDistancePointPlane(
+                edge.twin.face.centroid(vertices),
+                face.plane,
+            ) < epsilon); // since the merge criterion is the opposite of this, i think this holds
+
+            // walk in a cycle around the head vertex
+            var walk2 = edge;
+            var steps: u32 = 0;
+            while (true) {
+                walk2 = walk2.twin.next;
+                steps += 1;
+                std.debug.assert(steps < @as(u32, @intCast(vertices.len * 2)));
+                if (walk2 == edge) break;
+            }
+            std.debug.assert(steps >= 3);
+
+            std.debug.assert(length(sub(
+                vertices[edge.next.tail_vertex],
+                vertices[edge.tail_vertex],
+            )) > epsilon);
+
+            n_sides += 1;
+            total_vertex_counts[edge.tail_vertex] += 1;
+            local_vertex_counts[edge.tail_vertex] += 1;
+
+            try faces_dfs.put(arena, edge.face, {});
+            try faces_dfs.put(arena, edge.twin.face, {});
+
+            std.debug.assert(!vertex_pairs.contains(.{ edge.tail_vertex, edge.next.tail_vertex }));
+            try vertex_pairs.put(arena, .{ edge.tail_vertex, edge.next.tail_vertex }, {});
+
+            // all vertices in an edge loop must be unique
+            for (local_vertex_counts) |count| std.debug.assert(count < 2);
+
+            edge = edge.next;
+            std.debug.assert(n_sides < @as(u32, @intCast(vertices.len * 2)));
+            if (edge == face.edge) break;
+        }
+
+        // ensure the plane we have isn't corrupted or old
+        std.debug.assert(dot(face.newellPlane(vertices)[0..3].*, face.plane[0..3].*) > 0.0);
+
+        n_faces += 1;
+        n_half_edges += n_sides;
+
+        std.debug.assert(n_sides >= 3);
+
+        std.debug.assert(n_faces < @as(u32, @intCast(vertices.len * 2)));
+        walk = face.next;
+    }
+
+    // all vertices (on the hull) must have at least three neighbouring faces
+    for (total_vertex_counts) |count| {
+        std.debug.assert((count == 0) or (count >= 3));
+        if (count > 0) n_vertices += 1;
+    }
+
+    // eulers formula
+    std.debug.assert(n_half_edges % 2 == 0);
+    std.debug.assert(n_vertices + n_faces - n_half_edges / 2 == 2);
+
+    // all faces in the dfs must be in the linked list and vice versa
+    std.debug.assert(faces_list.count() == faces_dfs.count());
+    var it_face = faces_list.keyIterator();
+    while (it_face.next()) |face| std.debug.assert(faces_dfs.contains(face.*));
+    it_face = faces_dfs.keyIterator();
+    while (it_face.next()) |face| std.debug.assert(faces_list.contains(face.*));
 }
