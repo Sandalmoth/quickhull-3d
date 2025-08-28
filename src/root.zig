@@ -111,6 +111,7 @@ pub fn quickhull(
             epsilon,
             &outside_vertices,
         );
+        debugPrint(faces);
 
         break;
     }
@@ -183,7 +184,7 @@ fn buildNewFaces(
         b.edge.prev.twin = a.edge.next;
 
         a.prev = null;
-        a.next = faces;
+        a.next = root;
         root.prev = a;
         root = a;
     }
@@ -714,6 +715,7 @@ fn qRandom(rand: std.Random) [4]f32 {
 }
 
 fn debugPrint(head: *Face) void {
+    std.debug.print("--- begin ---\n", .{});
     var walk: ?*Face = head;
     while (walk) |face| : (walk = face.next) {
         var edge = face.edge;
@@ -725,6 +727,7 @@ fn debugPrint(head: *Face) void {
         }
         std.debug.print("{}\n", .{edge.tail_vertex});
     }
+    std.debug.print("--- end ---\n", .{});
 }
 
 fn assertValid(
