@@ -2,9 +2,9 @@ const std = @import("std");
 
 const log = std.log.scoped(.quickhull_3d);
 
-const Vertex = [3]f32;
+pub const Vertex = [3]f32;
 
-const HalfEdge = struct {
+pub const HalfEdge = struct {
     next: *HalfEdge,
     prev: *HalfEdge,
     twin: *HalfEdge,
@@ -13,7 +13,7 @@ const HalfEdge = struct {
     face: *Face,
 };
 
-const Face = struct {
+pub const Face = struct {
     next: ?*Face,
     prev: ?*Face,
 
@@ -21,6 +21,16 @@ const Face = struct {
     edge: *HalfEdge,
     conflicts: ?*Conflict,
     visited: bool,
+
+    pub fn numEdges(face: *const Face) u32 {
+        var n: u32 = 0;
+        var walk = face.edge;
+        while (true) {
+            n += 1;
+            walk = walk.next;
+            if (walk == face.edge) return n;
+        }
+    }
 
     pub fn centroid(face: *const Face, vertices: []const Vertex) Vertex {
         var edge = face.edge;
@@ -54,7 +64,7 @@ const Face = struct {
             if (edge == face.edge) break;
         }
         const norm = 1.0 / length(normal);
-        normal = scale(normal, 1.0 / norm);
+        normal = scale(normal, norm);
         ctr = scale(ctr, 1.0 / n);
         return .{
             normal[0],
@@ -86,7 +96,6 @@ pub fn quickhull(
 
     // while there are still points outside the polytope, expand it to include them
     while (findConflict(vertices, faces)) |conflict| {
-        std.debug.print("{any} {any}\n", .{ conflict.face.plane, vertices[conflict.vertex] });
         conflict.face.visited = true;
 
         var horizon: std.SegmentedList(*HalfEdge, 4) = .{};
@@ -101,7 +110,6 @@ pub fn quickhull(
 
         var outside_vertices = try getOutside(arena, faces);
         faces = removeVisited(faces);
-
         faces = try buildNewFaces(
             arena,
             vertices,
@@ -111,9 +119,9 @@ pub fn quickhull(
             epsilon,
             &outside_vertices,
         );
-        debugPrint(faces);
 
-        break;
+        // we might get coplanar faces, remove them
+        faces = try repair(vertices, faces, epsilon);
     }
 
     return faces;
@@ -131,12 +139,10 @@ fn buildNewFaces(
     var root = faces;
     var new_faces: std.ArrayList(*Face) = try .initCapacity(arena, horizon.count());
 
-    std.debug.print("horizon (len={})\n", .{horizon.count()});
     var it_horizon = horizon.iterator(0);
     while (it_horizon.next()) |h| {
         const edge = h.*;
         const twin = edge.twin;
-        std.debug.print("  {}->{}\n", .{ edge.tail_vertex, twin.tail_vertex });
 
         const new_face = try arena.create(Face);
         new_faces.appendAssumeCapacity(new_face);
@@ -192,81 +198,89 @@ fn buildNewFaces(
     return root;
 }
 
-// fn doRepairs(...) {
+fn repair(vertices: []const Vertex, faces: *Face, epsilon: f32) !*Face {
+    var root = faces;
 
-//         merge_loop: while (true) {
-//             walk = faces;
-//             while (walk) |face| {
-//                 var edge = face.edge;
-//                 while (true) {
-//                     if (!isConvex(vertices, edge.face, edge.twin.face)) {
-//                         const new_plane = bestPlane(vertices, edge.face, edge.twin.face);
+    // i'm probably testing more things for repairs than what is truly necessary...
+    merge_loop: while (true) {
+        var walk: ?*Face = root;
+        while (walk) |face| : (walk = face.next) {
+            var edge = face.edge;
+            while (true) {
+                if (!isConvex(vertices, edge.face, edge.twin.face, epsilon)) {
+                    if (edge.twin.face.prev) |p| {
+                        p.next = edge.twin.face.next;
+                    } else {
+                        root = edge.twin.face.next.?;
+                    }
+                    if (edge.twin.face.next) |n| {
+                        n.prev = edge.twin.face.prev;
+                    }
 
-//                         if (edge.twin.face.prev) |p| {
-//                             p.next = edge.twin.face.next;
-//                         } else {
-//                             faces = edge.twin.face.next.?;
-//                         }
-//                         if (edge.twin.face.next) |n| {
-//                             n.prev = edge.twin.face.prev;
-//                         }
+                    face.edge = edge.prev;
+                    edge.twin.prev.face = edge.face;
+                    edge.twin.next.face = edge.face;
+                    edge.prev.next = edge.twin.next;
+                    edge.next.prev = edge.twin.prev;
+                    edge.twin.prev.next = edge.next;
+                    edge.twin.next.prev = edge.prev;
+                    face.plane = face.newellPlane(vertices);
 
-//                         face.edge = edge.prev;
-//                         face.plane = new_plane;
-//                         edge.twin.prev.face = edge.face;
-//                         edge.twin.next.face = edge.face;
-//                         edge.prev.next = edge.twin.next;
-//                         edge.next.prev = edge.twin.prev;
-//                         edge.twin.prev.next = edge.next;
-//                         edge.twin.next.prev = edge.prev;
+                    topology_loop: while (true) {
+                        edge = face.edge;
+                        while (true) {
+                            // we might end up with strange topology like nonconvex faces
+                            // so we need a second repair step to remove them
+                            if (edge.twin.face == edge.next.twin.face) {
+                                if (edge.twin.face.numEdges() == 3) {
+                                    // keep the last edge of the twin face
+                                    // drop edge and edge.next and the twin face
+                                    const last_edge = edge.twin.next;
+                                    last_edge.face = face;
+                                    edge.prev.next = last_edge;
+                                    last_edge.prev = edge.prev;
+                                    edge.next.next.prev = last_edge;
+                                    last_edge.next = edge.next.next;
+                                } else {
+                                    // keep edge and twin face
+                                    // drop edge.next
+                                    edge.next.next.prev = edge;
+                                    edge.next = edge.next.next;
+                                    edge.twin.prev.prev = edge.twin;
+                                    edge.twin.prev = edge.twin.prev.prev;
+                                }
+                                face.plane = face.newellPlane(vertices);
 
-//                         topology_loop: while (true) {
-//                             edge = face.edge;
-//                             while (true) {
-//                                 // i'm unsure if we might need to do multiple rounds of repair
-//                                 if (edge.twin.face == edge.next.twin.face) {
-//                                     face.plane = bestPlane(vertices, face, edge.twin.face);
-//                                     if (numSides(edge.twin.face) == 3) {
-//                                         // keep the last edge of the twin face
-//                                         // drop edge and edge.next and the twin face
-//                                         // TODO test correctness
-//                                         const last_edge = edge.twin.next;
-//                                         last_edge.face = face;
-//                                         edge.prev.next = last_edge;
-//                                         last_edge.prev = edge.prev;
-//                                         edge.next.next.prev = last_edge;
-//                                         last_edge.next = edge.next.next;
-//                                     } else {
-//                                         // keep edge and twin face
-//                                         // drop edge.next
-//                                         // TODO test correctness
-//                                         edge.next.next.prev = edge;
-//                                         edge.next = edge.next.next;
-//                                         edge.twin.prev.prev = edge.twin;
-//                                         edge.twin.prev = edge.twin.prev.prev;
-//                                     }
+                                continue :topology_loop;
+                            }
+                            edge = edge.next;
+                            if (edge == face.edge) break;
+                        }
+                        break;
+                    }
 
-//                                     continue :topology_loop;
-//                                 }
-//                                 edge = edge.next;
-//                                 if (edge == face.edge) break;
-//                             }
-//                             break;
-//                         }
+                    continue :merge_loop;
+                }
 
-//                         continue :merge_loop;
-//                     }
+                edge = edge.next;
+                if (edge == face.edge) break;
+            }
+        }
 
-//                     edge = edge.next;
-//                     if (edge == face.edge) break;
-//                 }
-//                 walk = face.next;
-//             }
+        break;
+    }
 
-//             break;
-//         }
+    root = root;
+    return root;
+}
 
-// }
+fn isConvex(vertices: []const Vertex, a: *Face, b: *Face, epsilon: f32) bool {
+    const ctr_a = a.centroid(vertices);
+    const ctr_b = b.centroid(vertices);
+
+    return (signedDistancePointPlane(ctr_a, b.plane) < -epsilon) and
+        (signedDistancePointPlane(ctr_b, a.plane) < -epsilon);
+}
 
 fn getOutside(
     arena: std.mem.Allocator,
@@ -571,7 +585,6 @@ fn buildInitialTetrahedron(
     face2.visited = false;
     face3.visited = false;
 
-    try assertValid(arena, face0, vertices, epsilon);
     return face0;
 }
 
@@ -677,15 +690,67 @@ test "rotated dodecahedron" {
     var rng = std.Random.DefaultPrng.init(1337);
     const rand = rng.random();
 
-    const N = 1;
+    const N = 1000;
     for (0..N) |_| {
         const q = qRandom(rand);
         var rotated = try std.ArrayList([3]f32).initCapacity(arena, vertices.len);
         for (vertices) |vertex| rotated.appendAssumeCapacity(qRotate(vertex, q));
 
-        const faces = try quickhull(arena, rotated.items, 1e-6);
-        debugPrint(faces);
-        try assertValid(arena, faces, rotated.items, 1e-6);
+        const faces = try quickhull(arena, rotated.items, 1e-5);
+        try assertValid(arena, faces, rotated.items, 1e-5);
+
+        var walk: ?*Face = faces;
+        var n: u32 = 0;
+        while (walk) |face| : (walk = face.next) {
+            try std.testing.expectEqual(5, face.numEdges());
+            n += 1;
+        }
+        try std.testing.expectEqual(12, n);
+
+        _ = arena_impl.reset(.retain_capacity);
+    }
+}
+
+test "rotated cubic grid" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    var vertices: std.ArrayList(Vertex) = .empty;
+    defer vertices.deinit(std.testing.allocator);
+    const K = 5;
+    for (0..2 * K + 1) |x| {
+        for (0..2 * K + 1) |y| {
+            for (0..2 * K + 1) |z| {
+                const fx: f32 = @as(f32, @floatFromInt(x)) - K;
+                const fy: f32 = @as(f32, @floatFromInt(y)) - K;
+                const fz: f32 = @as(f32, @floatFromInt(z)) - K;
+                try vertices.append(std.testing.allocator, .{ fx, fy, fz });
+            }
+        }
+    }
+
+    var rng = std.Random.DefaultPrng.init(1337);
+    const rand = rng.random();
+
+    const N = 1000;
+    for (0..N) |_| {
+        const q = qRandom(rand);
+        var rotated = try std.ArrayList([3]f32).initCapacity(arena, vertices.items.len);
+        for (vertices.items) |vertex| rotated.appendAssumeCapacity(qRotate(vertex, q));
+
+        const faces = try quickhull(arena, rotated.items, 1e-5);
+        try assertValid(arena, faces, rotated.items, 1e-5);
+
+        var walk: ?*Face = faces;
+        var n: u32 = 0;
+        while (walk) |face| : (walk = face.next) {
+            try std.testing.expectEqual(4, face.numEdges());
+            n += 1;
+        }
+        try std.testing.expectEqual(6, n);
+
+        _ = arena_impl.reset(.retain_capacity);
     }
 }
 
@@ -719,7 +784,7 @@ fn debugPrint(head: *Face) void {
     var walk: ?*Face = head;
     while (walk) |face| : (walk = face.next) {
         var edge = face.edge;
-        std.debug.print("{any}\n  ", .{face.plane});
+        std.debug.print("{any}\n  [{}] ", .{ face.plane, face.numEdges() });
         while (true) {
             std.debug.print("{}->", .{edge.tail_vertex});
             edge = edge.next;
@@ -796,7 +861,7 @@ fn assertValid(
             std.debug.assert(signedDistancePointPlane(
                 edge.twin.face.centroid(vertices),
                 face.plane,
-            ) < epsilon); // since the merge criterion is the opposite of this, i think this holds
+            ) < -epsilon); // the merge criterion is the opposite of this, so i think this holds
 
             // walk in a cycle around the head vertex
             var walk2 = edge;
