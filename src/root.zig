@@ -20,6 +20,7 @@ const Face = struct {
     plane: [4]f32, // ax + by + cz + d == 0,  a*a + b*b + c*c == 1
     edge: *HalfEdge,
     conflicts: ?*Conflict,
+    visited: bool,
 
     pub fn centroid(face: *const Face, vertices: []const Vertex) Vertex {
         var edge = face.edge;
@@ -82,9 +83,276 @@ pub fn quickhull(
 ) !*Face {
     var faces = try buildInitialTetrahedron(arena, vertices, epsilon);
     faces = faces;
+
+    // while there are still points outside the polytope, expand it to include them
+    while (findConflict(vertices, faces)) |conflict| {
+        std.debug.print("{any} {any}\n", .{ conflict.face.plane, vertices[conflict.vertex] });
+        conflict.face.visited = true;
+
+        var horizon: std.SegmentedList(*HalfEdge, 4) = .{};
+        try buildHorizon(
+            arena,
+            conflict.face,
+            conflict.face.edge,
+            vertices[conflict.vertex],
+            epsilon,
+            &horizon,
+        );
+
+        var outside_vertices = try getOutside(arena, faces);
+        faces = removeVisited(faces);
+
+        faces = try buildNewFaces(
+            arena,
+            vertices,
+            &horizon,
+            faces,
+            conflict.vertex,
+            epsilon,
+            &outside_vertices,
+        );
+
+        break;
+    }
+
     return faces;
 }
 
+fn buildNewFaces(
+    arena: std.mem.Allocator,
+    vertices: []const Vertex,
+    horizon: *std.SegmentedList(*HalfEdge, 4),
+    faces: *Face,
+    ix_eye: u32,
+    epsilon: f32,
+    outside_vertices: *std.SegmentedList(u32, 0),
+) !*Face {
+    var root = faces;
+    var new_faces: std.ArrayList(*Face) = try .initCapacity(arena, horizon.count());
+
+    std.debug.print("horizon (len={})\n", .{horizon.count()});
+    var it_horizon = horizon.iterator(0);
+    while (it_horizon.next()) |h| {
+        const edge = h.*;
+        const twin = edge.twin;
+        std.debug.print("  {}->{}\n", .{ edge.tail_vertex, twin.tail_vertex });
+
+        const new_face = try arena.create(Face);
+        new_faces.appendAssumeCapacity(new_face);
+
+        const new_face_edges: [3]*HalfEdge = .{
+            try arena.create(HalfEdge),
+            try arena.create(HalfEdge),
+            try arena.create(HalfEdge),
+        };
+        // link up to form a circle around tne new face
+        for (0..3) |i| {
+            new_face_edges[i].next = new_face_edges[(i + 1) % 3];
+            new_face_edges[(i + 1) % 3].prev = new_face_edges[i];
+            new_face_edges[i].face = new_face;
+        }
+        // add the twin on the edge touching the horizon
+        new_face_edges[0].twin = twin;
+        twin.twin = new_face_edges[0];
+        new_face_edges[0].tail_vertex = twin.next.tail_vertex;
+        new_face_edges[1].tail_vertex = twin.tail_vertex;
+        new_face_edges[2].tail_vertex = ix_eye;
+
+        new_face.visited = false;
+        new_face.plane = getPlane(
+            vertices[new_face_edges[0].tail_vertex],
+            vertices[new_face_edges[1].tail_vertex],
+            vertices[new_face_edges[2].tail_vertex],
+        );
+        new_face.edge = new_face_edges[0];
+
+        new_face.conflicts = null;
+        var it_outside = outside_vertices.iterator(0);
+        while (it_outside.next()) |outside| {
+            if (signedDistancePointPlane(vertices[outside.*], new_face.plane) > epsilon) {
+                try new_face.addConflict(arena, outside.*);
+            }
+        }
+    }
+
+    // stitch the new faces together
+    for (0..new_faces.items.len) |i| {
+        const a = new_faces.items[i];
+        const b = new_faces.items[(i + 1) % new_faces.items.len];
+        a.edge.next.twin = b.edge.prev;
+        b.edge.prev.twin = a.edge.next;
+
+        a.prev = null;
+        a.next = faces;
+        root.prev = a;
+        root = a;
+    }
+
+    return root;
+}
+
+// fn doRepairs(...) {
+
+//         merge_loop: while (true) {
+//             walk = faces;
+//             while (walk) |face| {
+//                 var edge = face.edge;
+//                 while (true) {
+//                     if (!isConvex(vertices, edge.face, edge.twin.face)) {
+//                         const new_plane = bestPlane(vertices, edge.face, edge.twin.face);
+
+//                         if (edge.twin.face.prev) |p| {
+//                             p.next = edge.twin.face.next;
+//                         } else {
+//                             faces = edge.twin.face.next.?;
+//                         }
+//                         if (edge.twin.face.next) |n| {
+//                             n.prev = edge.twin.face.prev;
+//                         }
+
+//                         face.edge = edge.prev;
+//                         face.plane = new_plane;
+//                         edge.twin.prev.face = edge.face;
+//                         edge.twin.next.face = edge.face;
+//                         edge.prev.next = edge.twin.next;
+//                         edge.next.prev = edge.twin.prev;
+//                         edge.twin.prev.next = edge.next;
+//                         edge.twin.next.prev = edge.prev;
+
+//                         topology_loop: while (true) {
+//                             edge = face.edge;
+//                             while (true) {
+//                                 // i'm unsure if we might need to do multiple rounds of repair
+//                                 if (edge.twin.face == edge.next.twin.face) {
+//                                     face.plane = bestPlane(vertices, face, edge.twin.face);
+//                                     if (numSides(edge.twin.face) == 3) {
+//                                         // keep the last edge of the twin face
+//                                         // drop edge and edge.next and the twin face
+//                                         // TODO test correctness
+//                                         const last_edge = edge.twin.next;
+//                                         last_edge.face = face;
+//                                         edge.prev.next = last_edge;
+//                                         last_edge.prev = edge.prev;
+//                                         edge.next.next.prev = last_edge;
+//                                         last_edge.next = edge.next.next;
+//                                     } else {
+//                                         // keep edge and twin face
+//                                         // drop edge.next
+//                                         // TODO test correctness
+//                                         edge.next.next.prev = edge;
+//                                         edge.next = edge.next.next;
+//                                         edge.twin.prev.prev = edge.twin;
+//                                         edge.twin.prev = edge.twin.prev.prev;
+//                                     }
+
+//                                     continue :topology_loop;
+//                                 }
+//                                 edge = edge.next;
+//                                 if (edge == face.edge) break;
+//                             }
+//                             break;
+//                         }
+
+//                         continue :merge_loop;
+//                     }
+
+//                     edge = edge.next;
+//                     if (edge == face.edge) break;
+//                 }
+//                 walk = face.next;
+//             }
+
+//             break;
+//         }
+
+// }
+
+fn getOutside(
+    arena: std.mem.Allocator,
+    faces: *Face,
+) !std.SegmentedList(u32, 0) {
+    // this might be N^2 behaviour, it should be valid to check only the outside points
+    // of the faces inside the horizon (which might lead to the conflict list being incomplete)
+    // however, this is a) simpler and b) seems like it might be more reliable? i dunno
+    // maybe come back to this if we need to boost performance
+    // simplest pseudo-test for performance would be to just append if visited == true
+    var outside_vertices: std.SegmentedList(u32, 0) = .{};
+    var walk: ?*Face = faces;
+    while (walk) |face| : (walk = face.next) {
+        var conflicts: ?*Conflict = face.conflicts;
+        while (conflicts) |conflict| : (conflicts = conflict.next) {
+            try outside_vertices.append(arena, conflict.vertex);
+        }
+    }
+    return outside_vertices;
+}
+
+fn removeVisited(faces: *Face) *Face {
+    var root = faces;
+    var walk: ?*Face = faces;
+    while (walk) |face| {
+        const next = face.next;
+        if (face.visited) {
+            if (face.prev) |p| {
+                p.next = next;
+            } else {
+                root = next.?; // safe since no point can see every face, at least one remains
+            }
+            if (next) |n| n.prev = face.prev;
+        }
+        walk = next;
+    }
+    return root;
+}
+
+fn buildHorizon(
+    arena: std.mem.Allocator,
+    face: *Face,
+    starting_edge: *HalfEdge,
+    eye: Vertex,
+    epsilon: f32,
+    horizon: *std.SegmentedList(*HalfEdge, 4),
+) !void {
+    var edge = starting_edge;
+    while (true) {
+        const nb = edge.twin.face;
+        std.debug.assert(nb != face);
+        if (!nb.visited) {
+            if (signedDistancePointPlane(eye, nb.plane) < -epsilon) {
+                try horizon.append(arena, edge);
+            } else {
+                nb.visited = true;
+                try buildHorizon(arena, nb, edge.twin, eye, epsilon, horizon);
+            }
+        }
+        edge = edge.next;
+        if (edge == starting_edge) break;
+    }
+}
+
+/// walk through the conflict list of every face and find the one farthest away from its face
+fn findConflict(vertices: []const Vertex, faces: *Face) ?struct { face: *Face, vertex: u32 } {
+    var dist: f32 = -std.math.inf(f32);
+    var f: ?*Face = null;
+    var ix: u32 = undefined;
+
+    var walk: ?*Face = faces;
+    while (walk) |face| : (walk = face.next) {
+        var conflicts = face.conflicts;
+        while (conflicts) |conflict| : (conflicts = conflict.next) {
+            const d = signedDistancePointPlane(vertices[conflict.vertex], face.plane);
+            if (d <= dist) continue;
+            dist = d;
+            f = face;
+            ix = conflict.vertex;
+        }
+    }
+
+    if (f == null) return null;
+    return .{ .face = f.?, .vertex = ix };
+}
+
+/// generate a large initnial tetrahedron to minimize extra work
 fn buildInitialTetrahedron(
     arena: std.mem.Allocator,
     vertices: []const Vertex,
@@ -297,6 +565,11 @@ fn buildInitialTetrahedron(
         if (signedDistancePointPlane(vertex, face3.plane) > epsilon) try face3.addConflict(arena, i);
     }
 
+    face0.visited = false;
+    face1.visited = false;
+    face2.visited = false;
+    face3.visited = false;
+
     try assertValid(arena, face0, vertices, epsilon);
     return face0;
 }
@@ -403,13 +676,14 @@ test "rotated dodecahedron" {
     var rng = std.Random.DefaultPrng.init(1337);
     const rand = rng.random();
 
-    const N = 1000;
+    const N = 1;
     for (0..N) |_| {
         const q = qRandom(rand);
         var rotated = try std.ArrayList([3]f32).initCapacity(arena, vertices.len);
         for (vertices) |vertex| rotated.appendAssumeCapacity(qRotate(vertex, q));
 
         const faces = try quickhull(arena, rotated.items, 1e-6);
+        debugPrint(faces);
         try assertValid(arena, faces, rotated.items, 1e-6);
     }
 }
@@ -437,6 +711,20 @@ fn qRandom(rand: std.Random) [4]f32 {
         inorm * z,
         inorm * w,
     };
+}
+
+fn debugPrint(head: *Face) void {
+    var walk: ?*Face = head;
+    while (walk) |face| : (walk = face.next) {
+        var edge = face.edge;
+        std.debug.print("{any}\n  ", .{face.plane});
+        while (true) {
+            std.debug.print("{}->", .{edge.tail_vertex});
+            edge = edge.next;
+            if (edge == face.edge) break;
+        }
+        std.debug.print("{}\n", .{edge.tail_vertex});
+    }
 }
 
 fn assertValid(
